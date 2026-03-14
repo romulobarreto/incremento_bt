@@ -1,9 +1,15 @@
 """Módulo responsável pelo enriquecimento da base de incremento com dados da general_reports.
 
-Aplica 3 regras de cruzamento em cascata, por ordem de prioridade:
+Aplica 5 regras de cruzamento em cascata, por ordem de prioridade:
     Regra 1: INSTALACAO + IRREGULARIDADE + MÊS/ANO DATA_EXECUCAO
     Regra 2: INSTALACAO + IRREGULARIDADE + MÊS/ANO DATA_BAIXA
     Regra 3: INSTALACAO + MÊS/ANO DATA_BAIXA + CLASSIFICACAO_IRREG (grupo de códigos)
+    Regra 4: INSTALACAO + IRREGULARIDADE + MÊS/ANO EXEC (para registros SEM data_baixa_rep),
+             com fallback para MÊS/ANO BAIXA - 1 mês
+    Regra 5: INSTALACAO + CLASSIFICACAO_IRREG + MÊS/ANO EXEC (para registros SEM data_baixa_rep),
+             com fallback para MÊS/ANO BAIXA - 1 mês
+
+Regras 4 e 5 cobrem casos onde general_reports não possui data_baixa_rep (bug do SIGOS).
 
 Linhas que não encontrarem correspondência em nenhuma regra são exportadas
 para output/servicos_sem_cruzamento.xlsx e removidas da carga final.
@@ -16,7 +22,7 @@ import pandas as pd
 
 logger = logging.getLogger(__name__)
 
-# Mapa de irregularidade → classificação (usado na Regra 3)
+# Mapa de irregularidade → classificação (usado nas Regras 3 e 5)
 MAPA_CLASSIFICACAO = {
     109: 'C100', 115: 'C100', 129: 'C100', 154: 'REGU',
     164: 'C100', 165: 'C100', 168: 'C100', 171: 'C100',
@@ -35,6 +41,11 @@ MAPA_CLASSIFICACAO = {
 def _preparar_reports(df_rep: pd.DataFrame) -> pd.DataFrame:
     """Adiciona colunas de período (Mês/Ano) e classificação na general_reports."""
     df = df_rep.copy()
+
+    # Garante datetime
+    df["data_exec_rep"] = pd.to_datetime(df["data_exec_rep"], errors="coerce")
+    df["data_baixa_rep"] = pd.to_datetime(df["data_baixa_rep"], errors="coerce")
+
     df['mes_ano_exec']  = df['data_exec_rep'].dt.to_period('M')
     df['mes_ano_baixa'] = df['data_baixa_rep'].dt.to_period('M')
     df['classificacao'] = df['irregularidade'].map(MAPA_CLASSIFICACAO)
@@ -91,7 +102,6 @@ def _merge_e_preenche(
         )
 
     # Preenche IRREGULARIDADE se estava zerada
-    # Pode vir como 'irregularidade' (extra) ou já estar nas chaves (via join)
     irreg_col = 'irregularidade_rep' if 'irregularidade_rep' in merged.columns else 'irregularidade'
     if irreg_col in merged.columns:
         sem_irreg = df_inc['IRREGULARIDADE'] == 0
@@ -102,13 +112,73 @@ def _merge_e_preenche(
     return df_inc
 
 
+def _aplicar_regra_exec_mes_ano(
+    df_inc: pd.DataFrame,
+    df_rep_sem_baixa: pd.DataFrame,
+    chaves_inc: list[str],
+    chaves_rep: list[str],
+    usar_mes_anterior: bool,
+    mascara_base: pd.Series,
+) -> pd.DataFrame:
+    """
+    Função auxiliar para Regras 4 e 5.
+
+    Faz merge usando:
+      - no incremento: mes_ano_baixa ou (mes_ano_baixa - 1 mês)
+      - no reports: mes_ano_exec
+
+    Args:
+        df_inc: incremento.
+        df_rep_sem_baixa: general_reports filtrado apenas com data_baixa_rep nula.
+        chaves_inc: chaves no incremento (sem período).
+        chaves_rep: chaves no reports    (sem período).
+        usar_mes_anterior: se True, usa mes_ano_baixa - 1 mês.
+        mascara_base: linhas pendentes a considerar.
+
+    Returns:
+        df_inc atualizado.
+    """
+    df_inc_local = df_inc.copy()
+
+    # Só faz sentido onde temos DATA_BAIXA
+    pend = mascara_base & df_inc_local['DATA_BAIXA'].notna()
+    if not pend.any():
+        return df_inc_local
+
+    # Períodos no incremento
+    data_baixa = pd.to_datetime(df_inc_local.loc[pend, 'DATA_BAIXA'], errors='coerce')
+    periodo = data_baixa.dt.to_period('M')
+    if usar_mes_anterior:
+        periodo = (periodo - 1)  # período anterior
+
+    df_inc_local.loc[pend, 'mes_ano_exec_proxy'] = periodo
+
+    # Período no reports: já temos mes_ano_exec
+    df_rep_local = df_rep_sem_baixa.copy()
+
+    chaves_inc_full = chaves_inc + ['mes_ano_exec_proxy']
+    chaves_rep_full = chaves_rep + ['mes_ano_exec']
+
+    df_inc_local = _merge_e_preenche(
+        df_inc_local,
+        df_rep_local,
+        chaves_inc=chaves_inc_full,
+        chaves_rep=chaves_rep_full,
+        mascara_pendentes=pend,
+    )
+
+    # Limpa coluna auxiliar
+    df_inc_local.drop(columns=['mes_ano_exec_proxy'], inplace=True, errors='ignore')
+    return df_inc_local
+
+
 def enriquecer_incremento(
     df_inc: pd.DataFrame,
     df_rep: pd.DataFrame,
 ) -> pd.DataFrame:
     """Enriquece o DataFrame de incremento com EQUIPE, DATA_EXECUCAO e IRREGULARIDADE.
 
-    Aplica as 3 regras de cruzamento em cascata. Linhas sem correspondência
+    Aplica as 5 regras de cruzamento em cascata. Linhas sem correspondência
     são exportadas para output/servicos_sem_cruzamento.xlsx.
 
     Args:
@@ -171,6 +241,77 @@ def enriquecer_incremento(
     )
     achou_r3 = pendentes & df_inc['EQUIPE'].notna()
     logger.info('✅ [MERGE R3] %d linhas resolvidas.', achou_r3.sum())
+
+    # ------------------------------------------------------------------
+    # PREPARO PARA REGRAS 4 e 5: apenas registros do reports sem data_baixa_rep
+    # ------------------------------------------------------------------
+    df_rep_sem_baixa = df_rep[df_rep['data_baixa_rep'].isna()].copy()
+    logger.info('ℹ️ [MERGE] %d registros no general_reports sem data_baixa_rep para Regras 4 e 5.',
+                len(df_rep_sem_baixa))
+
+    # -------------------------------------------------------
+    # REGRA 4: INSTALACAO + IRREGULARIDADE + MÊS/ANO EXEC
+    #         (sem data_baixa_rep) + fallback mês anterior
+    # -------------------------------------------------------
+    pendentes = df_inc['EQUIPE'].isna() & (df_inc['IRREGULARIDADE'] != 0)
+    logger.info('🔍 [MERGE R4] %d linhas tentando Regra 4 (mes_ano_exec / mes_ano_exec-1)...', pendentes.sum())
+
+    # Primeiro tenta com mes_ano_baixa == mes_ano_exec
+    df_inc = _aplicar_regra_exec_mes_ano(
+        df_inc,
+        df_rep_sem_baixa,
+        chaves_inc=['INSTALACAO', 'IRREGULARIDADE'],
+        chaves_rep=['instalacao', 'irregularidade'],
+        usar_mes_anterior=False,
+        mascara_base=pendentes,
+    )
+    achou_r4_1 = pendentes & df_inc['EQUIPE'].notna()
+    logger.info('✅ [MERGE R4] %d linhas resolvidas na primeira passada (mes_ano igual).', achou_r4_1.sum())
+
+    # Depois tenta com mês anterior para quem ainda ficou pendente
+    pendentes_r4_2 = df_inc['EQUIPE'].isna() & (df_inc['IRREGULARIDADE'] != 0)
+    df_inc = _aplicar_regra_exec_mes_ano(
+        df_inc,
+        df_rep_sem_baixa,
+        chaves_inc=['INSTALACAO', 'IRREGULARIDADE'],
+        chaves_rep=['instalacao', 'irregularidade'],
+        usar_mes_anterior=True,
+        mascara_base=pendentes_r4_2,
+    )
+    achou_r4_2 = pendentes_r4_2 & df_inc['EQUIPE'].notna()
+    logger.info('✅ [MERGE R4] %d linhas resolvidas na segunda passada (mes_ano - 1).', achou_r4_2.sum())
+
+    # -------------------------------------------------------
+    # REGRA 5: INSTALACAO + CLASSIFICACAO_IRREG + MÊS/ANO EXEC
+    #         (sem data_baixa_rep) + fallback mês anterior
+    # -------------------------------------------------------
+    pendentes = df_inc['EQUIPE'].isna()
+    logger.info('🔍 [MERGE R5] %d linhas tentando Regra 5 (mes_ano_exec / mes_ano_exec-1)...', pendentes.sum())
+
+    # Primeiro tenta com mes_ano_baixa == mes_ano_exec
+    df_inc = _aplicar_regra_exec_mes_ano(
+        df_inc,
+        df_rep_sem_baixa,
+        chaves_inc=['INSTALACAO', 'CLASSIFICACAO_IRREG'],
+        chaves_rep=['instalacao', 'classificacao'],
+        usar_mes_anterior=False,
+        mascara_base=pendentes,
+    )
+    achou_r5_1 = pendentes & df_inc['EQUIPE'].notna()
+    logger.info('✅ [MERGE R5] %d linhas resolvidas na primeira passada (mes_ano igual).', achou_r5_1.sum())
+
+    # Depois tenta com mês anterior para quem ainda ficou pendente
+    pendentes_r5_2 = df_inc['EQUIPE'].isna()
+    df_inc = _aplicar_regra_exec_mes_ano(
+        df_inc,
+        df_rep_sem_baixa,
+        chaves_inc=['INSTALACAO', 'CLASSIFICACAO_IRREG'],
+        chaves_rep=['instalacao', 'classificacao'],
+        usar_mes_anterior=True,
+        mascara_base=pendentes_r5_2,
+    )
+    achou_r5_2 = pendentes_r5_2 & df_inc['EQUIPE'].notna()
+    logger.info('✅ [MERGE R5] %d linhas resolvidas na segunda passada (mes_ano - 1).', achou_r5_2.sum())
 
     # -------------------------------------------------------
     # SEPARAÇÃO: linhas com e sem correspondência
