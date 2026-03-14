@@ -11,7 +11,7 @@ Estratégias:
 from typing import Optional
 
 import pandas as pd
-from sqlalchemy import Engine, create_engine, text, inspect
+from sqlalchemy import Date, Engine, create_engine, inspect, text
 
 
 def criar_engine_supabase(db_uri: str) -> Engine:
@@ -52,7 +52,7 @@ def carregar_incremento(
     nome_tabela: str = "increment_bt",
     schema: Optional[str] = None,
     replace_strategy: str = "truncate-insert",
-    chunksize: int = 5000,
+    chunksize: int = 500,
 ) -> None:
     """Carrega dados no banco usando estratégia segura para snapshots.
 
@@ -75,6 +75,11 @@ def carregar_incremento(
     """
     tabela = f"{schema}.{nome_tabela}" if schema else nome_tabela
 
+    tipos_sql = {
+        'DATA_EXECUCAO': Date(),
+        'DATA_BAIXA': Date(),
+    }
+
     with engine.begin() as conn:
         if replace_strategy == "truncate-insert":
             # Limpa apenas se a tabela já existir
@@ -91,6 +96,7 @@ def carregar_incremento(
                 schema=schema,
                 method="multi",
                 chunksize=chunksize,
+                dtype=tipos_sql,
             )
         elif replace_strategy == "append":
             df.to_sql(
@@ -101,6 +107,7 @@ def carregar_incremento(
                 schema=schema,
                 method="multi",
                 chunksize=chunksize,
+                dtype=tipos_sql,
             )
         else:
             raise ValueError(
