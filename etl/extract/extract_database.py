@@ -1,21 +1,35 @@
-"""Módulo responsável pela extração de dados do banco de dados Supabase."""
+"""Extração do Supabase: recorte mínimo da tabela general_reports.
+
+- Filtra "GRUPO" = 'BT' (sem filtrar Regional).
+- Sanitiza UC/instalação (mantém só dígitos, remove zeros à esquerda).
+- Ordena DATA_EXECUCAO DESC para priorizar o mais recente nos merges.
+"""
+
 
 import pandas as pd
 from sqlalchemy import Engine, text
 
+def _to_nullable_int(series: pd.Series) -> pd.Series:
+    """Converte para Int64 (nullable) preservando apenas valores inteiros.
+    Valores não-inteiros viram NA.
+    """
+    s = pd.to_numeric(series, errors="coerce")          # -> float64 com NaN
+    s = s.astype("Float64")                             # aceita pd.NA
+    mask_int = s.isna() | ((s % 1).abs() < 1e-9)        # inteiro "de verdade"
+    s = s.where(mask_int, pd.NA).round(0)               # zera frações que restaram
+    return s.astype("Int64")                            # -> Int64 (nullable)
+
+def _sanear_instalacao(series: pd.Series) -> pd.Series:
+    s = (
+        series.astype(str)
+        .str.strip()
+        .str.replace(r"\D", "", regex=True)  # mantém só dígitos
+        .str.lstrip("0")
+    )
+    # instalacao deve ser inteiro; usa o mesmo helper
+    return _to_nullable_int(s)
 
 def ler_general_reports(engine: Engine) -> pd.DataFrame:
-    """Lê a tabela general_reports do banco, trazendo apenas as colunas necessárias.
-
-    Ordena do serviço mais recente para o mais antigo para garantir que,
-    em caso de duplicidade no merge, o registro mais novo seja priorizado.
-
-    Args:
-        engine: Conexão SQLAlchemy com o banco de dados.
-
-    Returns:
-        DataFrame com as colunas necessárias para o enriquecimento.
-    """
     query = text("""
         SELECT
             "UC / MD"       AS instalacao,
@@ -30,13 +44,14 @@ def ler_general_reports(engine: Engine) -> pd.DataFrame:
 
     df = pd.read_sql(query, engine)
 
-    df['instalacao']    = pd.to_numeric(df['instalacao'], errors='coerce')
-    df['irregularidade'] = pd.to_numeric(df['irregularidade'], errors='coerce')
-    df['data_exec_rep']  = pd.to_datetime(df['data_exec_rep'], errors='coerce')
-    df['data_baixa_rep'] = pd.to_datetime(df['data_baixa_rep'], errors='coerce')
+    # Tipos básicos + sanitização
+    df["instalacao"]     = _sanear_instalacao(df["instalacao"])         
+    df["irregularidade"] = _to_nullable_int(df["irregularidade"])        
+    df["data_exec_rep"]  = pd.to_datetime(df["data_exec_rep"], errors="coerce")
+    df["data_baixa_rep"] = pd.to_datetime(df["data_baixa_rep"], errors="coerce")
 
     # Remove linhas sem instalação (chave obrigatória)
-    df = df[df['instalacao'].notna()].copy()
+    df = df[df["instalacao"].notna()].copy()
 
-    print(f'✅ [EXTRACT DB] {len(df)} registros carregados da general_reports.')
+    print(f"✅ [EXTRACT DB] {len(df)} registros carregados da general_reports.")
     return df
