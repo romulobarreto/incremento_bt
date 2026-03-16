@@ -4,6 +4,7 @@
 - Converte datas para datetime (DATE no banco).
 - Converte inteiros para Int64 (nullable).
 - Normaliza CLASSIFICACAO_IRREG a partir do mapa de códigos, quando possível.
+- **Importante**: colunas dos meses (MES_01..MES_12) preservam NULL (não convertem vazio para 0).
 """
 
 from __future__ import annotations
@@ -47,12 +48,16 @@ def transformar_incremento(df: pd.DataFrame) -> pd.DataFrame:
     df["DATA_EXECUCAO"] = pd.to_datetime(df["DATA_EXECUCAO"], errors="coerce").dt.normalize()
     df["DATA_BAIXA"]    = pd.to_datetime(df["DATA_BAIXA"],    errors="coerce").dt.normalize()
 
-    # Inteiros
-    cols_int = ["INSTALACAO","CMPT","IRREGULARIDADE","INC_TOTAL",
-                "MES_01","MES_02","MES_03","MES_04","MES_05","MES_06",
-                "MES_07","MES_08","MES_09","MES_10","MES_11","MES_12"]
-    for col in cols_int:
+    # Inteiros (gerais) -> mantém comportamento atual com fillna(0) para estas colunas
+    cols_int_gerais = ["INSTALACAO","CMPT","IRREGULARIDADE","INC_TOTAL"]
+    for col in cols_int_gerais:
         df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0).astype("Int64")
+
+    # Meses -> **preservar NULL** (não usar fillna(0))
+    meses = [f"MES_{i:02d}" for i in range(1, 13)]
+    for col in meses:
+        df[col] = pd.to_numeric(df[col], errors="coerce").astype("Int64")
+        # Observação: valores vazios/strings não numéricas viram <NA> (NULL no banco)
 
     # Textos
     for col in ["GRUPO","PROJETO","NOTA","CLASSIFICACAO_IRREG"]:
