@@ -357,14 +357,22 @@ def enriquecer_incremento(df_inc: pd.DataFrame, df_rep: pd.DataFrame) -> pd.Data
     # Telemetria de pendentes
     df = _telemetria_pendentes(df, df_rep)
 
-    # Exportar pendentes
+    # Exportar pendentes por GRUPO
     df_pend = df[~df["MATCH_OK"]].copy()
     df_pend.drop(columns=["mes_ano_exec", "mes_ano_baixa"], errors="ignore", inplace=True)
+
     if not df_pend.empty:
         os.makedirs("output", exist_ok=True)
-        caminho = "output/servicos_sem_cruzamento.xlsx"
-        df_pend.to_excel(caminho, index=False)
-        logger.warning("⚠️ [MERGE] %d pendentes exportados para %s", len(df_pend), caminho)
+
+        for grupo, sufixo in [("BAIXA TENSAO", "bt"), ("GESTAO CENTRALIZADA", "at")]:
+            df_grupo = df_pend[df_pend["GRUPO"] == grupo]
+            if not df_grupo.empty:
+                caminho = f"output/servicos_sem_cruzamento_{sufixo}.xlsx"
+                df_grupo.to_excel(caminho, index=False)
+                logger.warning(
+                    "⚠️ [MERGE] %d pendentes do grupo %s exportados para %s",
+                    len(df_grupo), grupo, caminho
+                )
     else:
         logger.info("🎉 [MERGE] Todas as linhas foram resolvidas com sucesso!")
 

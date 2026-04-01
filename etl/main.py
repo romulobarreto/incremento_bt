@@ -64,22 +64,44 @@ def main() -> None:
         schema = None  # ajuste se usar schema
         tabela_ja_existia = _tabela_existe(engine, nome_tabela, schema)
 
-        # LOAD
-        logger.info("📤 [LOAD] Carregando dados na tabela %s...", nome_tabela)
-        carregar_incremento(
-            df=df_final, engine=engine, nome_tabela=nome_tabela,
-            schema=schema, replace_strategy="truncate-insert", chunksize=500,
-        )
-        logger.info("✅ [LOAD] %d linhas carregadas na tabela %s.", len(df_final), nome_tabela); barra.update(1)
+        # ===================== LOAD (COM SPLIT POR GRUPO) =====================
+        schema = None
 
-        # se a tabela NÃO existia antes, cria/verifica índices
-        if not tabela_ja_existia:
-            logger.info("🛠️ [POST-LOAD] Criando/verificando índices (primeira criação da tabela)...")
-            # arquivo .sql (na raiz do projeto): sql/create_indexes_increment_bt.sql
-            run_sql_file(engine, "sql/create_indexes_increment_bt.sql")
-            logger.info("✅ [POST-LOAD] Índices aplicados com sucesso.")
-        else:
-            logger.info("ℹ️ [POST-LOAD] Tabela já existia; índices não foram reaplicados.")
+        # Mapeamento GRUPO -> TABELA
+        MAPA_TABELAS = {
+            "BAIXA TENSAO": "increment_bt",
+            "GESTAO CENTRALIZADA": "increment_at",
+        }
+
+        for grupo, nome_tabela in MAPA_TABELAS.items():
+            df_grupo = df_final[df_final["GRUPO"] == grupo].copy()
+
+            if df_grupo.empty:
+                logger.info("ℹ️ [LOAD] Nenhum registro do grupo %s para carregar.", grupo)
+                continue
+
+            # Verifica se a tabela já existia ANTES do load
+            tabela_ja_existia = _tabela_existe(engine, nome_tabela, schema)
+
+            logger.info("📤 [LOAD] Carregando %d linhas do grupo %s na tabela %s...",
+                        len(df_grupo), grupo, nome_tabela)
+
+            carregar_incremento(
+                df=df_grupo,
+                engine=engine,
+                nome_tabela=nome_tabela,
+                schema=schema,
+                replace_strategy="truncate-insert",
+                chunksize=500,
+            )
+
+            logger.info("✅ [LOAD] Grupo %s carregado com sucesso.", grupo)
+
+            # Cria índices apenas se a tabela NÃO existia
+            if not tabela_ja_existia:
+                logger.info("🛠️ [POST-LOAD] Criando índices para a tabela %s...", nome_tabela)
+                run_sql_file(engine, f"sql/create_indexes_{nome_tabela}.sql")
+                logger.info("✅ [POST-LOAD] Índices criados/verificados para %s.", nome_tabela)
 
     logger.info("🏁 Pipeline ETL finalizado com sucesso!")
 

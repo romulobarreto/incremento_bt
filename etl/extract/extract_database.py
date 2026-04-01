@@ -38,7 +38,6 @@ def ler_general_reports(engine: Engine) -> pd.DataFrame:
             "DATA BAIXADO"  AS data_baixa_rep,
             "EQUIPE"        AS equipe
         FROM general_reports
-        WHERE "GRUPO" = 'BT'
         ORDER BY "DATA_EXECUCAO" DESC NULLS LAST
     """)
 
